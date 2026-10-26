@@ -1,0 +1,30 @@
+name: Unsigned IPA
+
+# Builds an unsigned .ipa for sideloading from Windows (Sideloadly signs it with a free Apple ID).
+on:
+  workflow_dispatch:
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build (device, unsigned)
+        run: |
+          xcodebuild build -project IPhoneAgent.xcodeproj -scheme IPhoneAgent -configuration Release \
+            -destination generic/platform=iOS -derivedDataPath build \
+            IA_BUNDLE_ID=com.ryancollins.esp32agent \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+      - name: Package
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/IPhoneAgent.app Payload/
+          test -d Payload/IPhoneAgent.app/PlugIns/AgentActivity.appex
+          zip -qr ESP32Agent.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ESP32Agent-ipa
+          path: ios/ESP32Agent.ipa
