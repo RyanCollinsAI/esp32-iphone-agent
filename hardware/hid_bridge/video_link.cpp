@@ -1,8 +1,14 @@
 // Mirrored H.264 from AirPlay to BLE, see video_link.h.
 #include "video_link.h"
+#include <WiFi.h>
 #include <esp_heap_caps.h>
 #include "ble_link.h"
+#include "netcfg.h"
 #include "src/video/gop.h"
+
+// The same stream over TCP for a computer on the board's network (Windows BLE carries only ~120 kbps):
+// one client at a time, each AU framed as [u32 len][u8 flags][u32 board ms] (little endian) + Annex-B.
+const uint16_t TCP_PORT = 7200;
 
 // GOP since the latest IDR; overflow drops it until the next IDR. A still screen gets an IDR only every
 // few minutes, so room for ~27 min of AUs at 5 fps (P-frames of a still screen are tiny).
@@ -129,6 +135,49 @@ static void streamStep() {
     if (!sendAu(scratch, au.len, au.idr ? VF_IDR : 0, au.ts)) { txGen = UINT32_MAX; return; }
 }
 
+static WiFiServer server(TCP_PORT);
+static WiFiClient client;
+
+static bool tcpAu(const uint8_t *p, size_t n, uint8_t flags, uint32_t ts) {
+  uint8_t hdr[9];
+  uint32_t len = n;
+  memcpy(hdr, &len, 4);
+  hdr[4] = flags;
+  memcpy(hdr + 5, &ts, 4);
+  return client.write(hdr, sizeof hdr) == sizeof hdr && client.write(p, n) == n;
+}
+
+// streamStep for the TCP client: a new client gets SPS/PPS and the GOP from its IDR, then every AU.
+static void tcpStep() {
+  static bool listening;
+  static uint32_t txGen = UINT32_MAX;
+  static int next;
+  static uint8_t cfg[GOP_CFG_MAX];
+  if (!listening) {
+    if (!net_up()) return;
+    server.begin();
+    server.setNoDelay(true);
+    listening = true;
+  }
+  if (!client.connected()) {
+    client = server.accept();
+    if (!client) return;
+    client.setNoDelay(true);
+    txGen = UINT32_MAX;
+  }
+  uint32_t gen, cfg_ts;
+  size_t cfg_len;
+  int n;
+  if (!snapshot(&gen, &n, cfg, &cfg_len, &cfg_ts)) return;
+  if (gen != txGen) {
+    txGen = gen;
+    next = 0;
+    if (!tcpAu(cfg, cfg_len, VF_CONFIG, cfg_ts)) { client.stop(); return; }
+  }
+  for (gop_au au; next < n && copyAu(gen, next, &au); next++)
+    if (!tcpAu(scratch, au.len, au.idr ? VF_IDR : 0, au.ts)) { client.stop(); return; }
+}
+
 static void videoTask(void *) {
   for (;;) {
     Req r;
@@ -140,6 +189,7 @@ static void videoTask(void *) {
       ble_reply(reply);
     }
     streamStep();
+    tcpStep();
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
   }
 }
