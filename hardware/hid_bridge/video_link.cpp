@@ -2,6 +2,7 @@
 #include "video_link.h"
 #include <WiFi.h>
 #include <esp_heap_caps.h>
+#include <freertos/message_buffer.h>
 #include "ble_link.h"
 #include "netcfg.h"
 #include "src/video/gop.h"
@@ -138,6 +139,24 @@ static void streamStep() {
 static WiFiServer server(TCP_PORT);
 static WiFiClient client;
 
+// Once a client has the GOP, it gets each new AU straight from the mirror task through this buffer, so a
+// GOP overflow (a playing video fills it in seconds) never stalls it: the buffer only feeds a fresh client.
+const size_t LIVE_CAP = 1024 * 1024;
+const size_t LIVE_AU_MAX = 256 * 1024;  // bigger AUs drop the client back to a GOP resync
+static MessageBufferHandle_t live;
+static StaticMessageBuffer_t liveCtl;
+static uint8_t *liveStage, *liveOut;  // [u8 flags][u32 ts][Annex-B]: staged in the mirror task, read in ours
+static volatile bool tcpLive;
+
+static void liveSend(const uint8_t *p, size_t n, uint8_t flags, uint32_t ts) {  // caller holds lock
+  if (!tcpLive) return;
+  if (n > LIVE_AU_MAX) { tcpLive = false; return; }
+  liveStage[0] = flags;
+  memcpy(liveStage + 1, &ts, 4);
+  memcpy(liveStage + 5, p, n);
+  if (xMessageBufferSend(live, liveStage, n + 5, 0) != n + 5) tcpLive = false;  // client too slow: resync
+}
+
 static bool tcpAu(const uint8_t *p, size_t n, uint8_t flags, uint32_t ts) {
   uint8_t hdr[9];
   uint32_t len = n;
@@ -147,7 +166,7 @@ static bool tcpAu(const uint8_t *p, size_t n, uint8_t flags, uint32_t ts) {
   return client.write(hdr, sizeof hdr) == sizeof hdr && client.write(p, n) == n;
 }
 
-// streamStep for the TCP client: a new client gets SPS/PPS and the GOP from its IDR, then every AU.
+// A new client gets SPS/PPS and the GOP from its IDR (as streamStep does), then the live buffer.
 static void tcpStep() {
   static bool listening;
   static uint32_t txGen = UINT32_MAX;
@@ -160,10 +179,19 @@ static void tcpStep() {
     listening = true;
   }
   if (!client.connected()) {
+    tcpLive = false;
     client = server.accept();
     if (!client) return;
     client.setNoDelay(true);
     txGen = UINT32_MAX;
+  }
+  if (tcpLive) {
+    for (size_t n; (n = xMessageBufferReceive(live, liveOut, LIVE_AU_MAX + 5, 0)) > 0;) {
+      uint32_t ts;
+      memcpy(&ts, liveOut + 1, 4);
+      if (!tcpAu(liveOut + 5, n - 5, liveOut[0], ts)) { client.stop(); return; }
+    }
+    return;
   }
   uint32_t gen, cfg_ts;
   size_t cfg_len;
@@ -176,6 +204,12 @@ static void tcpStep() {
   }
   for (gop_au au; next < n && copyAu(gen, next, &au); next++)
     if (!tcpAu(scratch, au.len, au.idr ? VF_IDR : 0, au.ts)) { client.stop(); return; }
+  xSemaphoreTake(lock, portMAX_DELAY);
+  if (gop.gen == txGen && !gop.wait_idr && gop.n == next) {  // caught up: no AU slipped in since
+    xMessageBufferReset(live);
+    tcpLive = true;
+  }
+  xSemaphoreGive(lock);
 }
 
 static void videoTask(void *) {
@@ -198,7 +232,11 @@ bool video_begin() {
   uint8_t *arena = (uint8_t *)heap_caps_malloc(GOP_CAP, MALLOC_CAP_SPIRAM);
   gop_au *aus = (gop_au *)heap_caps_malloc(MAX_AUS * sizeof(gop_au), MALLOC_CAP_SPIRAM);
   scratch = (uint8_t *)heap_caps_malloc(SCRATCH_CAP, MALLOC_CAP_SPIRAM);
-  if (!arena || !aus || !scratch) return false;
+  uint8_t *liveBuf = (uint8_t *)heap_caps_malloc(LIVE_CAP, MALLOC_CAP_SPIRAM);
+  liveStage = (uint8_t *)heap_caps_malloc(LIVE_AU_MAX + 5, MALLOC_CAP_SPIRAM);
+  liveOut = (uint8_t *)heap_caps_malloc(LIVE_AU_MAX + 5, MALLOC_CAP_SPIRAM);
+  if (!arena || !aus || !scratch || !liveBuf || !liveStage || !liveOut) return false;
+  live = xMessageBufferCreateStatic(LIVE_CAP, liveBuf, &liveCtl);
   gop_init(&gop, arena, GOP_CAP, aus, MAX_AUS);
   lock = xSemaphoreCreateMutex();
   reqs = xQueueCreate(4, sizeof(Req));
@@ -208,6 +246,7 @@ bool video_begin() {
 void video_on_config(const uint8_t *sps_pps, size_t len) {
   xSemaphoreTake(lock, portMAX_DELAY);
   gop_set_config(&gop, sps_pps, len, millis());
+  liveSend(sps_pps, len, VF_CONFIG, millis());
   xSemaphoreGive(lock);
 }
 
@@ -228,6 +267,7 @@ void video_on_au(const uint8_t *au, size_t len, bool idr) {
   }
   xSemaphoreTake(lock, portMAX_DELAY);
   gop_push(&gop, au, len, idr, now);
+  liveSend(au, len, idr ? VF_IDR : 0, now);
   xSemaphoreGive(lock);
   xTaskNotifyGive(task);
 }
