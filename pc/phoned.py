@@ -38,6 +38,7 @@ AIM_TOLERANCE = 0.008    # screen fraction; a bigger miss is corrected before pr
 MAX_MISS = 0.06          # bigger misses are corrected but not learned from
 TAP_GAP = 0.15           # s to stay still after a click so iOS sees a finished tap
 HOLD = 0.25              # s to rest before lifting at the end of a swipe
+SHOW = 0.35              # s from a HID command until the phone's mirrored frame shows it at the board
 
 
 class Screen:
@@ -49,6 +50,8 @@ class Screen:
         self.gray: np.ndarray | None = None
         self.rgb: np.ndarray | None = None
         self.at = 0.0  # monotonic time of the latest decoded frame
+        self.shown = 0  # board clock (ms) when the latest decoded frame reached the board
+        self.offset: float | None = None  # board ms - local ms, set from status heartbeats
         self.frames = 0
         self.changed = asyncio.Event()
 
@@ -65,14 +68,14 @@ class Screen:
                 return  # P-frames without their IDR decode to smeared garbage
             if flags & IDR:
                 self.waiting = False
-            self.cur = bytearray(payload[4:])  # first 4 bytes: board timestamp
+            self.cur = (struct.unpack_from("<I", payload)[0], bytearray(payload[4:]))  # board timestamp, Annex-B
         elif self.cur is not None:
-            self.cur.extend(payload)
+            self.cur[1].extend(payload)
         if flags & END and self.cur is not None:
-            au, self.cur = bytes(self.cur), None
-            self._decode(au)
+            (ts, au), self.cur = self.cur, None
+            self._decode(bytes(au), ts)
 
-    def _decode(self, au: bytes):
+    def _decode(self, au: bytes, ts: int):
         try:
             frames = self.codec.decode(av.Packet(au))
         except av.error.InvalidDataError:
@@ -82,7 +85,7 @@ class Screen:
             self.rgb = f.to_ndarray(format="rgb24")
             r, g, b = (self.rgb[..., i].astype(np.uint16) for i in range(3))
             self.gray = ((r * 299 + g * 587 + b * 114 + 500) // 1000).astype(np.uint8)
-            self.at = time.monotonic()
+            self.at, self.shown = time.monotonic(), ts
             self.frames += 1
             self.changed.set()
 
@@ -90,26 +93,20 @@ class Screen:
     def live(self) -> bool:
         return self.gray is not None
 
-    async def fresh(self, since: float, timeout: float) -> np.ndarray | None:
-        """The first frame decoded after `since`, or None."""
+    async def after(self, t: float, timeout: float = 3.0) -> np.ndarray:
+        """The screen as it was SHOW s after local time `t`: the first frame that reached the board by then.
+        The video lags ~1 s over BLE, so "the latest frame" right after a command still shows the old screen.
+        A still screen sends no frames, so on timeout the latest frame is the answer."""
+        assert self.offset is not None, "no status heartbeat yet, board clock unknown"
+        want = (t + SHOW) * 1000 + self.offset
         end = time.monotonic() + timeout
-        while self.at <= since:
-            left = end - time.monotonic()
-            if left <= 0:
-                return None
+        while self.shown < want and time.monotonic() < end:
             self.changed.clear()
             try:
-                await asyncio.wait_for(self.changed.wait(), left)
+                await asyncio.wait_for(self.changed.wait(), end - time.monotonic())
             except TimeoutError:
-                return None
+                break
         return self.gray
-
-    async def settled(self, quiet: float, least: float, most: float):
-        """Wait until no new frame arrived for `quiet` s (at least `least`, at most `most`)."""
-        t0 = time.monotonic()
-        await asyncio.sleep(least)
-        while time.monotonic() - t0 < most and time.monotonic() - self.at < quiet:
-            await asyncio.sleep(0.05)
 
 
 def find_pointer(a: np.ndarray, b: np.ndarray, near, shift: float, reach=(0.12, 0.08)):
@@ -163,7 +160,10 @@ class Board:
         try:
             self.status = json.loads(data)
         except ValueError:
-            pass
+            return
+        # the heartbeat left the board before we got it, so the largest up - now is the closest clock offset
+        offset = self.status["up"] - time.monotonic() * 1000
+        self.screen.offset = offset if self.screen.offset is None else max(self.screen.offset, offset)
 
     @property
     def connected(self) -> bool:
@@ -235,16 +235,10 @@ class Pointer:
 
     async def _wiggle(self, near, reach, nudge: int):
         """Nudge the pointer right and back; returns where it was (fractions) or None."""
-        await self.screen.settled(quiet=0.3, least=0.2, most=2.0)
-        before, sent = self.screen.gray, time.monotonic()
+        before = await self.screen.after(time.monotonic())
         await self.board.send(f"move {nudge} 0")
-        after = await self.screen.fresh(sent, timeout=2.0)
-        if after is not None:
-            await self.screen.settled(quiet=0.25, least=0.15, most=1.0)
-            after = self.screen.gray
+        after = await self.screen.after(time.monotonic())
         await self.board.send(f"move {-nudge} 0")
-        if before is None or after is None:
-            return None
         shift = nudge / (self.span[0] if self.span else 400)
         return find_pointer(before, after, near, shift, reach) or find_pointer(before, after, (0.5, 0.5), shift, (0.5, 0.5))
 
@@ -352,8 +346,7 @@ def main():
             if op == "screen":
                 assert screen.live, "no screen yet: is Screen Mirroring to ESP32 Agent on and the phone unlocked?"
                 assert not screen.waiting, "screen is stale, a snap is catching up (see the phoned pane); retry shortly"
-                if a.get("settle", True):
-                    await screen.settled(quiet=0.5, least=0.3, most=3.0)
+                await screen.after(time.monotonic())
                 shots["n"] += 1
                 plain, gridded = OUT / "screen.png", OUT / "screen-grid.png"
                 Image.fromarray(screen.rgb).save(plain)
