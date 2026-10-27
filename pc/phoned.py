@@ -4,10 +4,10 @@
 # ///
 """phoned: drive the iPhone from a Windows/Linux/Mac computer through the ESP32 board, no iOS app needed.
 
-The computer is one more BLE central on the board (docs/ble-protocol.md), next to the phone's own app.
-It keeps `stream on`, decodes the mirrored screen, and moves the AssistiveTouch pointer with the same
-closed loop as the app (Pointer.swift, Vision.swift): relative mouse moves from a homed corner, a span
-calibrated by finding the pointer on screen, and a wiggle check before each tap.
+The board joins the home Wi-Fi (pc/join_wifi.py) and the phone mirrors to it there. The computer sends HID
+commands over BLE (docs/ble-protocol.md) and reads the mirrored H.264 from the board over TCP, then moves the
+AssistiveTouch pointer with the same closed loop as the app (Pointer.swift, Vision.swift): relative mouse
+moves from a homed corner, a span calibrated by finding the pointer on screen, and a check before each tap.
 
     uv run pc/phoned.py            # serves http://127.0.0.1:8806 ; drive it with pc/phone.py
 """
@@ -24,8 +24,9 @@ from bleak import BleakClient, BleakScanner
 from PIL import Image, ImageDraw
 
 BASE = "6e400001-a9e8-4b1b-9c39-6d6f8a3c"
-CMD, REPLY, STATUS, VIDEO = (BASE + s for s in ("0001", "0002", "0003", "0004"))
-START, END, IDR, CONFIG, BENCH = 1, 2, 4, 8, 16
+CMD, REPLY, STATUS = (BASE + s for s in ("0001", "0002", "0003"))
+IDR, CONFIG = 4, 8
+TCP_PORT = 7200
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "out"
 CALIB = HERE / "calibration.json"
@@ -43,12 +44,13 @@ SHOW = 0.35              # s from a HID command until the phone's mirrored frame
 
 
 class Screen:
-    """Decodes the board's H.264 notifies into the latest frame (gray for diffs, RGB for screenshots)."""
+    """The mirrored screen from the board's TCP stream (port 7200, see video_link.cpp): Windows BLE carries only
+    ~120 kbps, too little for video, so BLE does HID and Wi-Fi does video. Keeps the latest frame (gray for
+    diffs, RGB for screenshots) and when it reached the board (board clock)."""
 
     def __init__(self):
         self.codec = av.CodecContext.create("h264", "r")
-        self.expect, self.cur, self.waiting = None, None, True
-        self.catching_up = False  # a snap is resending the GOP: frames are older than they look
+        self.waiting = True  # no IDR since (re)connecting: P-frames alone decode to smeared garbage
         self.gray: np.ndarray | None = None
         self.rgb: np.ndarray | None = None
         self.at = 0.0  # monotonic time of the latest decoded frame
@@ -57,27 +59,29 @@ class Screen:
         self.frames = 0
         self.changed = asyncio.Event()
 
-    def feed(self, data: bytes):
-        seq, flags = struct.unpack_from("<HB", data)
-        payload = data[3:]
-        if self.expect is not None and seq != self.expect:
-            self.cur, self.waiting = None, True
-        self.expect = (seq + 1) & 0xFFFF
-        if flags & BENCH:
-            return
-        if flags & START:
-            if self.waiting and not flags & (CONFIG | IDR):
-                return  # P-frames without their IDR decode to smeared garbage
-            if flags & IDR:
-                self.waiting = False
-            self.cur = (struct.unpack_from("<I", payload)[0], bytearray(payload[4:]))  # board timestamp, Annex-B
-        elif self.cur is not None:
-            self.cur[1].extend(payload)
-        if flags & END and self.cur is not None:
-            (ts, au), self.cur = self.cur, None
-            self._decode(bytes(au), ts)
+    async def run(self, board_ip):
+        """Read the board's stream forever; a new connection starts with SPS/PPS and the GOP from its IDR."""
+        while True:
+            ip = board_ip()
+            if not ip:
+                await asyncio.sleep(1)
+                continue
+            try:
+                reader, writer = await asyncio.open_connection(ip, TCP_PORT)
+                print(f"video: connected to {ip}:{TCP_PORT}", flush=True)
+                self.codec, self.waiting = av.CodecContext.create("h264", "r"), True
+                while True:
+                    n, flags, ts = struct.unpack("<IBI", await reader.readexactly(9))
+                    self._au(await reader.readexactly(n), flags, ts)
+            except (OSError, asyncio.IncompleteReadError) as e:
+                print(f"video: {type(e).__name__} {e}, reconnecting", flush=True)
+                await asyncio.sleep(2)
 
-    def _decode(self, au: bytes, ts: int):
+    def _au(self, au: bytes, flags: int, ts: int):
+        if self.waiting and not flags & (CONFIG | IDR):
+            return
+        if flags & IDR:
+            self.waiting = False
         try:
             frames = self.codec.decode(av.Packet(au))
         except av.error.InvalidDataError:
@@ -163,10 +167,9 @@ class Board:
             raise RuntimeError("board services missing on this link, reconnecting")
         await self.client.start_notify(REPLY, self._on_reply)
         await self.client.start_notify(STATUS, self._on_status)
-        await self.client.start_notify(VIDEO, lambda _, d: self.screen.feed(bytes(d)))
         self.links += 1
         print(f"board: connected to {dev.name}, mtu {self.client.mtu_size}", flush=True)
-        await self.send("stream on")
+        await self.send("stream off")  # video comes over Wi-Fi; keep BLE free for commands
 
     def _on_reply(self, _, data: bytearray):
         rid, _, rest = data.decode(errors="replace").partition(" ")
@@ -362,11 +365,11 @@ def main():
             if op == "status":
                 return web.json_response({"connected": board.connected, "frames": screen.frames,
                                           "frame_age_s": round(time.monotonic() - screen.at, 1) if screen.live else None,
-                                          "stale": screen.waiting or screen.catching_up,
+                                          "stale": screen.waiting,
                                           "calibrated": pointer.span, "board": board.status})
             if op == "screen":
                 assert screen.live, "no screen yet: is Screen Mirroring to ESP32 Agent on and the phone unlocked?"
-                assert not (screen.waiting or screen.catching_up), "screen is stale, a snap is catching up (see the phoned pane); retry shortly"
+                assert not screen.waiting, "no full frame yet: is the phone mirroring to ESP32 Agent?"
                 await screen.still()
                 shots["n"] += 1
                 plain, gridded = OUT / "screen.png", OUT / "screen-grid.png"
@@ -406,24 +409,12 @@ def main():
                 try:
                     if not board.connected:
                         await board.connect()
-                    elif screen.waiting:  # no clean picture: resend the GOP from its IDR (live P-frames off meanwhile)
-                        gop, kbps = board.status.get("gop", 0), max(board.status.get("ble", {}).get("kbps", 0), 50)
-                        timeout = max(20, gop * 8 / 1000 / kbps * 2)
-                        print(f"board: screen stale, snap of {gop // 1024} KB (up to {timeout:.0f} s)", flush=True)
-                        screen.catching_up = True  # the IDR comes first, the rest of the GOP takes minutes
-                        try:
-                            await board.send("stream off")
-                            await board.send("snap", timeout=timeout)
-                            await board.send("stream on")
-                        finally:
-                            screen.catching_up = False
-                        print(f"board: snap done, screen {'clean' if not screen.waiting else 'STILL STALE'}", flush=True)
-                    elif time.monotonic() - screen.at > 3:
-                        await board.send("stream on")  # stream is board-wide: the phone's app turns it off when it stops
                 except Exception as e:  # board off or out of range: say so and keep trying
                     print(f"board: {e}", flush=True)
                 await asyncio.sleep(2)
+        board_ip = lambda: board.status.get("ip") if board.status.get("net") == "sta" else None  # noqa: E731
         app["keepalive"] = asyncio.create_task(loop())
+        app["video"] = asyncio.create_task(screen.run(board_ip))
 
     app = web.Application()
     app.router.add_route("*", "/{op}", handle)
