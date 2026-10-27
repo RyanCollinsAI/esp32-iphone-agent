@@ -36,6 +36,7 @@ STOPS = (150, 350)       # calibration finds the pointer at these distances from
 REHOME_EVERY = 10        # gestures between re-homing
 AIM_TOLERANCE = 0.008    # screen fraction; a bigger miss is corrected before pressing
 MAX_MISS = 0.06          # bigger misses are corrected but not learned from
+AIM_TRIES = 4            # measure-and-correct rounds before a tap
 TAP_GAP = 0.15           # s to stay still after a click so iOS sees a finished tap
 HOLD = 0.25              # s to rest before lifting at the end of a swipe
 SHOW = 0.35              # s from a HID command until the phone's mirrored frame shows it at the board
@@ -47,6 +48,7 @@ class Screen:
     def __init__(self):
         self.codec = av.CodecContext.create("h264", "r")
         self.expect, self.cur, self.waiting = None, None, True
+        self.catching_up = False  # a snap is resending the GOP: frames are older than they look
         self.gray: np.ndarray | None = None
         self.rgb: np.ndarray | None = None
         self.at = 0.0  # monotonic time of the latest decoded frame
@@ -108,6 +110,18 @@ class Screen:
                 break
         return self.gray
 
+    async def still(self, timeout: float = 4.0) -> np.ndarray:
+        """The screen once animations (page slides, app launches) have stopped: two frames ~0.3 s apart that match."""
+        end = time.monotonic() + timeout
+        prev = await self.after(time.monotonic())
+        while time.monotonic() < end:
+            await asyncio.sleep(0.3)
+            cur = await self.after(time.monotonic())
+            if np.count_nonzero(np.abs(cur.astype(np.int16) - prev.astype(np.int16)) > 30) < 400:
+                return cur
+            prev = cur
+        return prev
+
 
 def find_pointer(a: np.ndarray, b: np.ndarray, near, shift: float, reach=(0.12, 0.08)):
     """Where the pointer is in `a`, given it moved right by `shift` (fraction of width) in `b`. Port of Vision.pointer."""
@@ -141,8 +155,12 @@ class Board:
         dev = await BleakScanner.find_device_by_filter(
             lambda d, ad: (d.name or ad.local_name or "").startswith("ESP32 Agent"), timeout=20)
         assert dev, "board not found: is it plugged into the phone (powered) and in range?"
-        self.client = BleakClient(dev, timeout=20, disconnected_callback=lambda _: print("board: link lost", flush=True))
+        self.client = BleakClient(dev, timeout=20, winrt={"use_cached_services": False},
+                                  disconnected_callback=lambda _: print("board: link lost", flush=True))
         await self.client.connect()
+        if self.client.services.get_characteristic(CMD) is None:  # Windows reused a dying link from a previous run
+            await self.client.disconnect()
+            raise RuntimeError("board services missing on this link, reconnecting")
         await self.client.start_notify(REPLY, self._on_reply)
         await self.client.start_notify(STATUS, self._on_status)
         await self.client.start_notify(VIDEO, lambda _, d: self.screen.feed(bytes(d)))
@@ -235,7 +253,7 @@ class Pointer:
 
     async def _wiggle(self, near, reach, nudge: int):
         """Nudge the pointer right and back; returns where it was (fractions) or None."""
-        before = await self.screen.after(time.monotonic())
+        before = await self.screen.still()
         await self.board.send(f"move {nudge} 0")
         after = await self.screen.after(time.monotonic())
         await self.board.send(f"move {-nudge} 0")
@@ -270,21 +288,24 @@ class Pointer:
         await self._move_to(*self._units(x, y))
         if not aim:
             return None
-        found = await self._wiggle((x, y), (0.12, 0.08), NUDGE if x < 0.9 else -NUDGE)
-        if found is None:
-            return "pointer not found, tapped where it should be"
-        fx, fy = found
-        if max(abs(fx - x), abs(fy - y)) <= MAX_MISS:
-            self._remember("x", (self.fix(x, "x"), fx))
-            self._remember("y", (self.fix(y, "y"), fy))
-            self._save()
-        if abs(fx - x) <= AIM_TOLERANCE and abs(fy - y) <= AIM_TOLERANCE:
-            return f"on target (miss {max(abs(fx - x), abs(fy - y)):.3f})"
-        mx, my = round((x - fx) * self.span[0]), round((y - fy) * self.span[1])
-        await self.board.send(f"move {mx} {my}")
-        if self.pos:
-            self.pos = (self.pos[0] + mx, self.pos[1] + my)
-        return f"corrected a miss of {fx - x:+.3f}, {fy - y:+.3f}"
+        misses = []
+        for i in range(AIM_TRIES):  # iOS accelerates long moves differently from short ones: correct until close
+            found = await self._wiggle((x, y), (0.2, 0.2), NUDGE if x < 0.9 else -NUDGE)
+            if found is None:
+                return f"pointer not found after {misses or 'no'} corrections, tapped where it should be"
+            fx, fy = found
+            misses.append(f"{fx - x:+.3f},{fy - y:+.3f}")
+            if i == 0 and max(abs(fx - x), abs(fy - y)) <= MAX_MISS:
+                self._remember("x", (self.fix(x, "x"), fx))
+                self._remember("y", (self.fix(y, "y"), fy))
+                self._save()
+            if abs(fx - x) <= AIM_TOLERANCE and abs(fy - y) <= AIM_TOLERANCE:
+                return f"on target, misses {' '.join(misses)}"
+            mx, my = round((x - fx) * self.span[0]), round((y - fy) * self.span[1])
+            await self.board.send(f"move {mx} {my}")
+            if self.pos:
+                self.pos = (self.pos[0] + mx, self.pos[1] + my)
+        return f"still off after {AIM_TRIES} corrections, misses {' '.join(misses)}"
 
     async def tap(self, x: float, y: float, aim: bool = True):
         note = await self.point(x, y, aim)
@@ -341,12 +362,12 @@ def main():
             if op == "status":
                 return web.json_response({"connected": board.connected, "frames": screen.frames,
                                           "frame_age_s": round(time.monotonic() - screen.at, 1) if screen.live else None,
-                                          "stale": screen.waiting,
+                                          "stale": screen.waiting or screen.catching_up,
                                           "calibrated": pointer.span, "board": board.status})
             if op == "screen":
                 assert screen.live, "no screen yet: is Screen Mirroring to ESP32 Agent on and the phone unlocked?"
-                assert not screen.waiting, "screen is stale, a snap is catching up (see the phoned pane); retry shortly"
-                await screen.after(time.monotonic())
+                assert not (screen.waiting or screen.catching_up), "screen is stale, a snap is catching up (see the phoned pane); retry shortly"
+                await screen.still()
                 shots["n"] += 1
                 plain, gridded = OUT / "screen.png", OUT / "screen-grid.png"
                 Image.fromarray(screen.rgb).save(plain)
@@ -389,9 +410,13 @@ def main():
                         gop, kbps = board.status.get("gop", 0), max(board.status.get("ble", {}).get("kbps", 0), 50)
                         timeout = max(20, gop * 8 / 1000 / kbps * 2)
                         print(f"board: screen stale, snap of {gop // 1024} KB (up to {timeout:.0f} s)", flush=True)
-                        await board.send("stream off")
-                        await board.send("snap", timeout=timeout)
-                        await board.send("stream on")
+                        screen.catching_up = True  # the IDR comes first, the rest of the GOP takes minutes
+                        try:
+                            await board.send("stream off")
+                            await board.send("snap", timeout=timeout)
+                            await board.send("stream on")
+                        finally:
+                            screen.catching_up = False
                         print(f"board: snap done, screen {'clean' if not screen.waiting else 'STILL STALE'}", flush=True)
                     elif time.monotonic() - screen.at > 3:
                         await board.send("stream on")  # stream is board-wide: the phone's app turns it off when it stops
