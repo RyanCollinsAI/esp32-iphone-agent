@@ -62,8 +62,9 @@ class Screen:
             return
         if flags & START:
             if self.waiting and not flags & (CONFIG | IDR):
-                return
-            self.waiting = False
+                return  # P-frames without their IDR decode to smeared garbage
+            if flags & IDR:
+                self.waiting = False
             self.cur = bytearray(payload[4:])  # first 4 bytes: board timestamp
         elif self.cur is not None:
             self.cur.extend(payload)
@@ -346,9 +347,11 @@ def main():
             if op == "status":
                 return web.json_response({"connected": board.connected, "frames": screen.frames,
                                           "frame_age_s": round(time.monotonic() - screen.at, 1) if screen.live else None,
+                                          "stale": screen.waiting,
                                           "calibrated": pointer.span, "board": board.status})
             if op == "screen":
                 assert screen.live, "no screen yet: is Screen Mirroring to ESP32 Agent on and the phone unlocked?"
+                assert not screen.waiting, "screen is stale, a snap is catching up (see the phoned pane); retry shortly"
                 if a.get("settle", True):
                     await screen.settled(quiet=0.5, least=0.3, most=3.0)
                 shots["n"] += 1
@@ -386,12 +389,22 @@ def main():
     async def keepalive(app):
         async def loop():
             while True:
-                if not board.connected:
-                    try:
+                try:
+                    if not board.connected:
                         await board.connect()
-                    except Exception as e:  # board off or out of range: say so and keep trying
-                        print(f"board: {e}", flush=True)
-                await asyncio.sleep(5)
+                    elif screen.waiting:  # no clean picture: resend the GOP from its IDR (live P-frames off meanwhile)
+                        gop, kbps = board.status.get("gop", 0), max(board.status.get("ble", {}).get("kbps", 0), 50)
+                        timeout = max(20, gop * 8 / 1000 / kbps * 2)
+                        print(f"board: screen stale, snap of {gop // 1024} KB (up to {timeout:.0f} s)", flush=True)
+                        await board.send("stream off")
+                        await board.send("snap", timeout=timeout)
+                        await board.send("stream on")
+                        print(f"board: snap done, screen {'clean' if not screen.waiting else 'STILL STALE'}", flush=True)
+                    elif time.monotonic() - screen.at > 3:
+                        await board.send("stream on")  # stream is board-wide: the phone's app turns it off when it stops
+                except Exception as e:  # board off or out of range: say so and keep trying
+                    print(f"board: {e}", flush=True)
+                await asyncio.sleep(2)
         app["keepalive"] = asyncio.create_task(loop())
 
     app = web.Application()
