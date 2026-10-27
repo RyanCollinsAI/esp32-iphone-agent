@@ -14,6 +14,7 @@ moves from a homed corner, a span calibrated by finding the pointer on screen, a
 import asyncio
 import json
 import math
+import socket
 import struct
 import time
 from pathlib import Path
@@ -74,11 +75,15 @@ class Screen:
                 continue
             try:
                 reader, writer = await asyncio.open_connection(ip, TCP_PORT)
+                # a still screen sends nothing for minutes, so silence is no sign of a dead link, and a reconnect is
+                # costly (the board may have dropped its GOP: no picture until the next IDR, up to ~20 min).
+                # TCP keepalive finds a dead board instead: probe after 5 s idle, every 2 s.
+                writer.get_extra_info("socket").ioctl(socket.SIO_KEEPALIVE_VALS, (1, 5000, 2000))
                 print(f"video: connected to {ip}:{TCP_PORT}", flush=True)
                 self.codec, self.waiting = av.CodecContext.create("h264", "r"), True
-                while True:  # mirroring sends a few frames a second even on a still screen; silence = dead link
-                    n, flags, ts = struct.unpack("<IBI", await asyncio.wait_for(reader.readexactly(9), 20))
-                    self._au(await asyncio.wait_for(reader.readexactly(n), 20), flags, ts)
+                while True:
+                    n, flags, ts = struct.unpack("<IBI", await reader.readexactly(9))
+                    self._au(await reader.readexactly(n), flags, ts)
             except (OSError, asyncio.IncompleteReadError, TimeoutError) as e:
                 print(f"video: {type(e).__name__} {e}, reconnecting", flush=True)
                 await asyncio.sleep(2)
