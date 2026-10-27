@@ -13,6 +13,7 @@ moves from a homed corner, a span calibrated by finding the pointer on screen, a
 """
 import asyncio
 import json
+import math
 import struct
 import time
 from pathlib import Path
@@ -30,6 +31,7 @@ TCP_PORT = 7200
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "out"
 CALIB = HERE / "calibration.json"
+ADDR = HERE / "board-address.txt"  # the board's BLE address, saved on the first scan
 PORT = 8806
 
 NUDGE = 12               # mouse units the pointer is wiggled by to find it on screen
@@ -41,7 +43,9 @@ AIM_TRIES = 4            # measure-and-correct rounds before a tap
 SETTLE = 1.0            # s the pointer rests on the target before a tap presses
 CLICK_HOLD = 0.2         # s between press and release of a tap (a long press starts at ~0.5 s)
 TAP_GAP = 0.15          # s to stay still after a click so iOS sees a finished tap
-HOLD = 0.25              # s to rest before lifting at the end of a swipe
+PICKUP = 0.8             # s a press rests before a carry moves: picks up the icon under it
+CARRY_STEP = 15          # mouse units per step of a carry
+HOLD = 0.25             # s to rest before lifting at the end of a swipe
 SHOW = 0.35              # s from a HID command until the phone's mirrored frame shows it at the board
 
 
@@ -162,9 +166,13 @@ class Board:
         self.lock = asyncio.Lock()
 
     async def connect(self):
-        dev = await BleakScanner.find_device_by_filter(
-            lambda d, ad: (d.name or ad.local_name or "").startswith("ESP32 Agent"), timeout=20)
-        assert dev, "board not found: is it plugged into the phone (powered) and in range?"
+        # by address once known: a link Windows keeps after phoned exits stops the board advertising, so a scan misses it
+        dev = ADDR.read_text().strip() if ADDR.exists() else None
+        if dev is None:
+            found = await BleakScanner.find_device_by_filter(
+                lambda d, ad: (d.name or ad.local_name or "").startswith("ESP32 Agent"), timeout=20)
+            assert found, "board not found: is it plugged into the phone (powered) and in range?"
+            ADDR.write_text(dev := found.address)
         self.client = BleakClient(dev, timeout=20, winrt={"use_cached_services": False},
                                   disconnected_callback=lambda _: print("board: link lost", flush=True))
         await self.client.connect()
@@ -174,7 +182,7 @@ class Board:
         await self.client.start_notify(REPLY, self._on_reply)
         await self.client.start_notify(STATUS, self._on_status)
         self.links += 1
-        print(f"board: connected to {dev.name}, mtu {self.client.mtu_size}", flush=True)
+        print(f"board: connected to {dev}, mtu {self.client.mtu_size}", flush=True)
         await self.send("stream off")  # video comes over Wi-Fi; keep BLE free for commands
 
     def _on_reply(self, _, data: bytearray):
@@ -329,6 +337,27 @@ class Pointer:
         await asyncio.sleep(TAP_GAP)
         return note
 
+    async def carry(self, x: float, y: float):
+        """Pick up what is under the pointer (aim it first with `point`) and drop it at x, y: a long press, then
+        small steps, since one big move is not seen as a drag. The end is open loop: icons snap to their slot."""
+        assert self.pos, "pointer position unknown: aim it with `point` first"
+        tx, ty = self._units(x, y)
+        dx, dy = tx - self.pos[0], ty - self.pos[1]
+        n = max(1, math.ceil(max(abs(dx), abs(dy)) / CARRY_STEP))
+        await self.board.send("press")
+        try:
+            await asyncio.sleep(PICKUP)
+            done = (0, 0)
+            for i in range(1, n + 1):
+                step = (round(dx * i / n), round(dy * i / n))
+                await self.board.send(f"move {step[0] - done[0]} {step[1] - done[1]}")
+                done = step
+                await asyncio.sleep(0.03)
+            await asyncio.sleep(HOLD * 2)
+        finally:
+            await self.board.send("release")
+        self.pos = (tx, ty)
+
     async def drag(self, points: list[tuple[float, float]], hold: bool = True):
         await self.point(*points[0], aim=False)
         await self.board.send("press")
@@ -395,7 +424,11 @@ def main():
             if op == "tap":
                 note = await pointer.tap(frac(a["x"]), frac(a["y"]), aim=a.get("aim", True))
                 return web.json_response({"ok": True, "aim": note})
-            if op == "swipe":
+            if op == "point":  # aim only, nothing pressed: before a carry
+                return web.json_response({"ok": True, "aim": await pointer.point(frac(a["x"]), frac(a["y"]), aim=True)})
+            if op == "carry":
+                await pointer.carry(frac(a["x"]), frac(a["y"]))
+            elif op == "swipe":
                 await pointer.drag([(frac(a["x1"]), frac(a["y1"])), (frac(a["x2"]), frac(a["y2"]))], hold=a.get("hold", True))
             elif op == "hold":  # long press: context menus, home screen edit mode
                 note = await pointer.point(frac(a["x"]), frac(a["y"]), aim=True)

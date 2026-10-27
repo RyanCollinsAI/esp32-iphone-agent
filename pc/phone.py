@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 
 URL = "http://127.0.0.1:8806/"
-ARGS = {"tap": ["x", "y"], "hold": ["x", "y"], "swipe": ["x1", "y1", "x2", "y2"], "scroll": ["x", "y", "lines"],
+ARGS = {"tap": ["x", "y"], "hold": ["x", "y"], "point": ["x", "y"], "carry": ["x", "y"], "swipe": ["x1", "y1", "x2", "y2"], "scroll": ["x", "y", "lines"],
         "type": ["text"], "key": ["combo"], "raw": ["line"]}
 
 
