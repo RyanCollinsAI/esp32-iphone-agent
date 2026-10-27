@@ -138,6 +138,8 @@ def find_pointer(a: np.ndarray, b: np.ndarray, near, shift: float, reach=(0.12, 
         return None
     diff = np.abs(a[top:bottom, left:right].astype(np.int16) - b[top:bottom, left:right].astype(np.int16)) > 30
     ys, xs = np.nonzero(diff)
+    print(f"pointer: {len(xs)} changed px near {near}"
+          + (f", spread {xs.max() - xs.min()}x{ys.max() - ys.min()}" if len(xs) else ""), flush=True)
     if not 15 <= len(xs) <= diff.size // 4:
         return None  # nothing moved, or more than a pointer
     if xs.max() - xs.min() > 0.15 * w or ys.max() - ys.min() > 0.07 * h:
