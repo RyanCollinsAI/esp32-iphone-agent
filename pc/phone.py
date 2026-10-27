@@ -1,7 +1,7 @@
 """phone: drive the iPhone through phoned (pc/phoned.py). Coordinates are 0-1000 across / down the screen.
 
     phone status                 phone screen              # -> PNG paths (screen-grid.png has a 0-1000 grid)
-    phone calibrate              phone tap 500 620
+    phone calibrate              phone tap 500 620         phone hold 500 620   # long press
     phone swipe 500 800 500 300  phone scroll 500 500 -5   # lines: negative scrolls down
     phone type "hello"           phone key enter           # key combos: cmd+space, shift+tab, ...
     phone home                   phone back                phone raw "ping"
@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 
 URL = "http://127.0.0.1:8806/"
-ARGS = {"tap": ["x", "y"], "swipe": ["x1", "y1", "x2", "y2"], "scroll": ["x", "y", "lines"],
+ARGS = {"tap": ["x", "y"], "hold": ["x", "y"], "swipe": ["x1", "y1", "x2", "y2"], "scroll": ["x", "y", "lines"],
         "type": ["text"], "key": ["combo"], "raw": ["line"]}
 
 

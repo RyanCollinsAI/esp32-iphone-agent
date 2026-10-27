@@ -38,7 +38,8 @@ REHOME_EVERY = 10        # gestures between re-homing
 AIM_TOLERANCE = 0.008    # screen fraction; a bigger miss is corrected before pressing
 MAX_MISS = 0.06          # bigger misses are corrected but not learned from
 AIM_TRIES = 4            # measure-and-correct rounds before a tap
-TAP_GAP = 0.15           # s to stay still after a click so iOS sees a finished tap
+CLICK_HOLD = 0.12        # s between press and release of a tap
+TAP_GAP = 0.15          # s to stay still after a click so iOS sees a finished tap
 HOLD = 0.25              # s to rest before lifting at the end of a swipe
 SHOW = 0.35              # s from a HID command until the phone's mirrored frame shows it at the board
 
@@ -296,8 +297,10 @@ class Pointer:
         misses = []
         for i in range(AIM_TRIES):  # iOS accelerates long moves differently from short ones: correct until close
             found = await self._wiggle((x, y), (0.2, 0.2), NUDGE if x < 0.9 else -NUDGE)
-            if found is None:
-                return f"pointer not found after {misses or 'no'} corrections, tapped where it should be"
+            if found is None:  # an idle pointer fades in on the first wiggle: look once more
+                found = await self._wiggle((x, y), (0.2, 0.2), NUDGE if x < 0.9 else -NUDGE)
+            if found is None:  # never press blind: the button next door may be "Delete App"
+                raise RuntimeError(f"pointer not found after {misses or 'no'} corrections; not pressing (retry)")
             fx, fy = found
             misses.append(f"{fx - x:+.3f},{fy - y:+.3f}")
             if i == 0 and max(abs(fx - x), abs(fy - y)) <= MAX_MISS:
@@ -310,11 +313,15 @@ class Pointer:
             await self.board.send(f"move {mx} {my}")
             if self.pos:
                 self.pos = (self.pos[0] + mx, self.pos[1] + my)
-        return f"still off after {AIM_TRIES} corrections, misses {' '.join(misses)}"
+        raise RuntimeError(f"still off after {AIM_TRIES} corrections, misses {' '.join(misses)}; not pressing (retry)")
 
     async def tap(self, x: float, y: float, aim: bool = True):
         note = await self.point(x, y, aim)
-        await self.board.send("click")
+        await self.board.send("press")  # the board's instant "click" is ignored by iOS alert buttons
+        try:
+            await asyncio.sleep(CLICK_HOLD)
+        finally:
+            await self.board.send("release")
         await asyncio.sleep(TAP_GAP)
         return note
 
@@ -386,6 +393,14 @@ def main():
                 return web.json_response({"ok": True, "aim": note})
             if op == "swipe":
                 await pointer.drag([(frac(a["x1"]), frac(a["y1"])), (frac(a["x2"]), frac(a["y2"]))], hold=a.get("hold", True))
+            elif op == "hold":  # long press: context menus, home screen edit mode
+                note = await pointer.point(frac(a["x"]), frac(a["y"]), aim=True)
+                await board.send("press")
+                try:
+                    await asyncio.sleep(float(a.get("secs", 1.2)))
+                finally:
+                    await board.send("release")
+                return web.json_response({"ok": True, "aim": note})
             elif op == "type":
                 await board.send(f"type {a['text']}")
             elif op == "key":
