@@ -14,6 +14,7 @@ moves from a homed corner, a span calibrated by finding the pointer on screen, a
 import asyncio
 import json
 import math
+import os
 import socket
 import struct
 import time
@@ -74,11 +75,14 @@ class Screen:
                 await asyncio.sleep(1)
                 continue
             try:
-                reader, writer = await asyncio.open_connection(ip, TCP_PORT)
                 # a still screen sends nothing for minutes, so silence is no sign of a dead link, and a reconnect is
                 # costly (the board may have dropped its GOP: no picture until the next IDR, up to ~20 min).
                 # TCP keepalive finds a dead board instead: probe after 5 s idle, every 2 s.
-                writer.get_extra_info("socket").ioctl(socket.SIO_KEEPALIVE_VALS, (1, 5000, 2000))
+                sock = socket.socket()
+                sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 5000, 2000))
+                sock.setblocking(False)
+                await asyncio.wait_for(asyncio.get_running_loop().sock_connect(sock, (ip, TCP_PORT)), 10)
+                reader, writer = await asyncio.open_connection(sock=sock)
                 print(f"video: connected to {ip}:{TCP_PORT}", flush=True)
                 self.codec, self.waiting = av.CodecContext.create("h264", "r"), True
                 while True:
@@ -474,6 +478,9 @@ def main():
         board_ip = lambda: board.status.get("ip") if board.status.get("net") == "sta" else None  # noqa: E731
         app["keepalive"] = asyncio.create_task(loop())
         app["video"] = asyncio.create_task(screen.run(board_ip))
+        for name in ("keepalive", "video"):  # these loops never end: if one dies, stop phoned loudly
+            app[name].add_done_callback(lambda t, n=name: (print(f"phoned: {n} task died: {t.exception()!r}", flush=True),
+                                                           os._exit(1)))
 
     app = web.Application()
     app.router.add_route("*", "/{op}", handle)
