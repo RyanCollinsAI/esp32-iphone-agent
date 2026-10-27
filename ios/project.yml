@@ -40,6 +40,8 @@ targets:
         CFBundleURLTypes:
           - CFBundleURLName: $(IA_BUNDLE_ID)
             CFBundleURLSchemes: [iphoneagent]
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
         UIRequiresFullScreen: true
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         NSBluetoothAlwaysUsageDescription: ESP32 Agent talks to its USB board over Bluetooth to see the screen and move the pointer.
