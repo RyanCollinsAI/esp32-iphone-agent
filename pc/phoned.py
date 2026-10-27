@@ -38,7 +38,8 @@ REHOME_EVERY = 10        # gestures between re-homing
 AIM_TOLERANCE = 0.008    # screen fraction; a bigger miss is corrected before pressing
 MAX_MISS = 0.06          # bigger misses are corrected but not learned from
 AIM_TRIES = 4            # measure-and-correct rounds before a tap
-CLICK_HOLD = 0.12        # s between press and release of a tap
+SETTLE = 1.0            # s the pointer rests on the target before a tap presses
+CLICK_HOLD = 0.2         # s between press and release of a tap (a long press starts at ~0.5 s)
 TAP_GAP = 0.15          # s to stay still after a click so iOS sees a finished tap
 HOLD = 0.25              # s to rest before lifting at the end of a swipe
 SHOW = 0.35              # s from a HID command until the phone's mirrored frame shows it at the board
@@ -143,9 +144,11 @@ def find_pointer(a: np.ndarray, b: np.ndarray, near, shift: float, reach=(0.12, 
           + (f", spread {xs.max() - xs.min()}x{ys.max() - ys.min()}" if len(xs) else ""), flush=True)
     if not 15 <= len(xs) <= diff.size // 4:
         return None  # nothing moved, or more than a pointer
-    if xs.max() - xs.min() > 0.15 * w or ys.max() - ys.min() > 0.07 * h:
+    # a hovered button repaints its edges too: keep the spot around the median if it holds most of the change
+    spot = (np.abs(xs - np.median(xs)) <= 0.06 * w) & (np.abs(ys - np.median(ys)) <= 0.03 * h)
+    if spot.sum() < 15 or spot.sum() < 0.6 * len(xs):
         return None  # not one compact spot
-    return ((xs.mean() + left) / w - shift / 2, (ys.mean() + top) / h)
+    return ((xs[spot].mean() + left) / w - shift / 2, (ys[spot].mean() + top) / h)
 
 
 class Board:
@@ -317,7 +320,8 @@ class Pointer:
 
     async def tap(self, x: float, y: float, aim: bool = True):
         note = await self.point(x, y, aim)
-        await self.board.send("press")  # the board's instant "click" is ignored by iOS alert buttons
+        await asyncio.sleep(SETTLE)
+        await self.board.send("press")  # iOS alert buttons ignore an instant click, or one right after a move
         try:
             await asyncio.sleep(CLICK_HOLD)
         finally:
